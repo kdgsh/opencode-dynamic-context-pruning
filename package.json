@@ -29,6 +29,7 @@
         "verify:package": "node scripts/verify-package.mjs",
         "check:package": "npm run build && npm run verify:package",
         "prepublishOnly": "npm run check:package",
+        "prepare": "npm run build",
         "dev": "opencode plugin dev",
         "sandbox": "node scripts/sandbox.mjs",
         "typecheck": "tsc --noEmit && npm run typecheck --workspace=tests/logger",
