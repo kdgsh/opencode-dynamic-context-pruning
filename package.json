@@ -33,10 +33,11 @@
         "dev": "opencode plugin dev",
         "sandbox": "node scripts/sandbox.mjs",
         "typecheck": "tsc --noEmit && npm run typecheck --workspace=tests/logger",
-        "test": "node --import tsx --test tests/*.test.ts && npm test --workspace=tests/logger",
+        "test": "node --import tsx --test tests/*.test.ts && npm run --silent test:bun && npm test --workspace=tests/logger",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
-        "dcp": "tsx scripts/print.ts"
+        "dcp": "tsx scripts/print.ts",
+        "test:bun": "node scripts/test-bun.mjs"
     },
     "keywords": [
         "opencode",

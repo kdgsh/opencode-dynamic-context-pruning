@@ -516,6 +516,7 @@ export async function setup(ctx: Plugin.Context) {
                 }),
         })
         .then((registration) => {
+            if (!registration?.events) return
             emitNotify = (event) => registration.events.emit("notify", event)
         })
     logger.info("DCP V2 initialized")
