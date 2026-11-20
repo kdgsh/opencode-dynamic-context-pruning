@@ -27,6 +27,13 @@ const context = z.object({
     prunedMessageCount: z.number(),
     total: z.number(),
 })
+const progress = z.object({
+    bar: z.string(),
+    compressed: z.number(),
+    total: z.number(),
+    activeBlocks: z.number(),
+    blockId: z.number().optional(),
+})
 
 export const rpc = {
     id: "dcp",
@@ -42,6 +49,7 @@ export const rpc = {
                 stats,
             }),
         },
+        progress: { input: session, output: progress },
         manual: { input: session.extend({ enabled: z.boolean() }), output: z.object({}) },
     },
     // Server -> TUI notifications (prune/compress reports, command output).

@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import type { Plugin } from "@opencode/plugin/tui"
+import { createEffect, createSignal } from "solid-js"
 import { ContextDialog, PanelDialog, StatsDialog, StatusDialog } from "../tui/dialogs"
 import type { ViewApi } from "../tui/types"
 import { rpc } from "./rpc"
@@ -9,6 +10,11 @@ export async function setup(ctx: Plugin.Context) {
     const client = ctx.client.rpc(rpc)
     const options = () => ({ location: ctx.location ?? ctx.data.location.default() })
     if (!(await client.status({}, options())).enabled) return
+
+    const [progressTick, setProgressTick] = createSignal(0)
+    if (typeof ctx.data?.on === "function") {
+        ctx.data.on("rpc.dcp.notify", () => setProgressTick((value) => value + 1))
+    }
 
     // Render server-side DCP reports as transient toasts. Events are
     // ephemeral: nothing stored, nothing in model context.
@@ -46,6 +52,48 @@ export async function setup(ctx: Plugin.Context) {
         },
         ui: { dialog: { clear: () => ctx.ui.dialog.clear() } },
     }
+
+    type ProgressView = {
+        bar: string
+        compressed: number
+        total: number
+        activeBlocks: number
+        blockId?: number
+    }
+
+    function SidebarProgress(props: { sessionID: string }) {
+        const [value, setValue] = createSignal<ProgressView | null>(null)
+        createEffect(() => {
+            const sessionID = props.sessionID
+            progressTick()
+            void client
+                .progress({ sessionID }, options())
+                .then(setValue)
+                .catch(() => setValue(null))
+        })
+        const data = value()
+        if (!data) return null
+        return (
+            <box flexDirection="row" gap={1}>
+                <text fg={api.theme.current.accent}>DCP</text>
+                <text fg={api.theme.current.text}>{data.bar}</text>
+                {data.blockId ? (
+                    <text fg={api.theme.current.textMuted}>b{data.blockId}</text>
+                ) : null}
+                <text fg={api.theme.current.textMuted}>
+                    {data.compressed}/{data.total}
+                </text>
+            </box>
+        )
+    }
+
+    ctx.ui.slot({
+        append: "sidebar.footer",
+        render(input) {
+            return <SidebarProgress sessionID={input.sessionID} />
+        },
+    })
+
     function show(render: Parameters<typeof ctx.ui.dialog.show>[0]) {
         ctx.ui.dialog.set({ size: "xlarge" })
         ctx.ui.dialog.show(render)
