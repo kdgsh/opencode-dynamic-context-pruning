@@ -164,17 +164,37 @@ export async function setup(ctx: Plugin.Context) {
             config.manualMode.enabled,
         )
         await checkSession(client, state, logger, messages, config.manualMode.enabled)
-        const rule = [...agent.permissions, ...(session.permissions ?? [])].findLast(
-            (rule) => matchesGlob("compress", rule.action) && matchesGlob("*", rule.resource),
+        // Only rules that name the "compress" action explicitly decide DCP's
+        // verdict. V2 hosts ship agents with catch-all deny/ask policies and
+        // treat unmatched actions as "ask"; honoring those wildcards here
+        // silently disabled compression everywhere (the tool got deleted from
+        // the request or `allowed()` threw). This mirrors v1, which injected
+        // an explicit allow unless the user configured the tool directly.
+        // Wildcard policies still apply to the host's own enforcement; the
+        // permission evaluate hook below aligns the two.
+        const rules = [...agent.permissions, ...(session.permissions ?? [])]
+        const explicitRule = rules.findLast(
+            (rule) =>
+                rule.action !== "*" &&
+                matchesGlob("compress", rule.action) &&
+                matchesGlob("*", rule.resource),
         )
         state.compressPermission =
             config.compress.permission === "deny"
                 ? "deny"
-                : rule?.effect === "deny"
+                : explicitRule?.effect === "deny"
                   ? "deny"
-                  : config.compress.permission === "ask" || rule?.effect === "ask"
+                  : config.compress.permission === "ask" || explicitRule?.effect === "ask"
                     ? "ask"
                     : "allow"
+        logger.debug("DCP compress permission resolved", {
+            sessionID,
+            agent: selected,
+            permission: state.compressPermission,
+            source: explicitRule
+                ? `explicit rule ${explicitRule.action} -> ${explicitRule.effect}`
+                : "config default (wildcard host rules ignored)",
+        })
         return { state, entries, session, messages }
     }
 
@@ -182,6 +202,50 @@ export async function setup(ctx: Plugin.Context) {
         if (state.isSubAgent && !config.experimental.allowSubAgents)
             throw new Error("DCP compression is disabled in subagents")
         if (state.compressPermission === "deny") throw new Error("DCP compression is denied")
+    }
+
+    // The host's `event.tools` expects a JSON Schema, not a zod schema.
+    function compressToolInputSchema(definition: ToolDefinition): Record<string, unknown> {
+        try {
+            return tool.schema.toJSONSchema(tool.schema.object(definition.args)) as Record<
+                string,
+                unknown
+            >
+        } catch {
+            return { type: "object", properties: {} }
+        }
+    }
+
+    // Lazy description/schema source for self-healing tool exposure; the
+    // per-session execution path (tool.transform below) keeps building its own
+    // session-bound definition.
+    let compressDefinition: ToolDefinition | undefined
+    const compressDefinitionFor = () =>
+        config.compress.permission === "deny"
+            ? undefined
+            : (compressDefinition ??= (
+                  config.compress.mode === "message"
+                      ? createCompressMessageTool
+                      : createCompressRangeTool
+              )({
+                  client,
+                  state: createSessionState(),
+                  logger,
+                  config,
+                  prompts,
+              }))
+
+    // Align host enforcement with DCP's verdict. V2 hosts treat unmatched tool
+    // actions as "ask" and several built-in agents ship catch-all deny
+    // policies, so compress calls stall or fail even when DCP itself allows
+    // compression. Only the "compress" action is overridden, and only while
+    // DCP's own config is "allow" (explicit "deny"/"ask" configs keep host
+    // behavior untouched).
+    if (config.compress.permission === "allow") {
+        await ctx.permission.hook("evaluate", (evaluation) => {
+            if (evaluation.action !== "compress") return
+            evaluation.effect = "allow"
+        })
     }
 
     // permission.assert exists from OpenCode 2.0.29; the plugin types used here predate it.
@@ -236,7 +300,21 @@ export async function setup(ctx: Plugin.Context) {
                     delete event.tools?.compress
                     return
                 }
-                if (state.compressPermission === "deny") delete event.tools?.compress
+                if (state.compressPermission === "deny") {
+                    delete event.tools?.compress
+                } else if (event.tools.compress === undefined) {
+                    // Self-heal tool exposure: if the host dropped or never
+                    // listed the plugin tool, the injected nudges reference a
+                    // phantom tool and the model can never compress (total,
+                    // silent failure). Re-add it from DCP's own definition.
+                    const definition = compressDefinitionFor()
+                    if (definition) {
+                        event.tools.compress = {
+                            description: definition.description,
+                            input: compressToolInputSchema(definition),
+                        }
+                    }
+                }
                 state.modelContextLimit = await contextLimit(event.model)
                 state.systemPromptTokens = countTokens(
                     event.system.map((part) => part.text).join("\n"),

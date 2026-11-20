@@ -126,7 +126,9 @@ test("V2 cleans echoed IDs and priorities before injecting correct protected/mes
     ] as WithParts["parts"]
     stripHallucinations(raw, state.idFormat)
     assert.equal((raw[1]!.parts[0] as any).text, "It’s 2026.\n")
-    assert.equal((raw[1]!.parts[1] as any).state.output, "Result @b9@ @blocked@")
+    // Compact ID markers are DCP-injected and are removed from tool output;
+    // this is not the same as stripping arbitrary <dcp-*> file content.
+    assert.equal((raw[1]!.parts[1] as any).state.output, "Result  ")
     const settings = config("message")
     settings.compress.protectUserMessages = true
     assignMessageRefs(state, raw)

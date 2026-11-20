@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import "./lab/persistence-env"
 import test from "node:test"
 import { Logger } from "../lib/logger"
 import { createSessionState, type WithParts } from "../lib/state"
@@ -148,9 +149,7 @@ test("prune injects compressed summary into LLM context after sync keeps block a
     // 摘要必须实际注入（LLM 能读到被压缩的内容）
     const joined = messages
         .map((m) =>
-            (m.parts ?? [])
-                .map((p: any) => (typeof p.text === "string" ? p.text : ""))
-                .join(" "),
+            (m.parts ?? []).map((p: any) => (typeof p.text === "string" ? p.text : "")).join(" "),
         )
         .join("\n")
     assert.ok(
