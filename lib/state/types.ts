@@ -37,6 +37,10 @@ export interface CompressionBlock {
     runId: number
     active: boolean
     deactivatedByUser: boolean
+    /** Temporarily disabled because the turn that produced it is staged for revert. */
+    revertSuspended?: boolean
+    /** Permanently disabled because that revert was committed and the origin message is gone. */
+    deactivatedByRevert?: boolean
     compressedTokens: number
     summaryTokens: number
     durationMs: number

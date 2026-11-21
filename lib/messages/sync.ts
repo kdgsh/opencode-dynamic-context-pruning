@@ -55,6 +55,17 @@ export const syncCompressionBlocks = (
             continue
         }
 
+        if (block.revertSuspended || block.deactivatedByRevert) {
+            // An undo owns this block's lifecycle: keep it out of active
+            // compression until the revert is cleared or committed.
+            block.active = false
+            if (block.deactivatedAt === undefined) {
+                block.deactivatedAt = now
+            }
+            block.deactivatedByBlockId = undefined
+            continue
+        }
+
         const hasOriginMessage =
             typeof block.compressMessageId === "string" &&
             block.compressMessageId.length > 0 &&

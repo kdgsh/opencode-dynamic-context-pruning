@@ -1,5 +1,11 @@
 export { prune } from "./prune"
 export { syncCompressionBlocks } from "./sync"
+export {
+    suspendRevertedBlocks,
+    clearRevertSuspensions,
+    commitRevertSuspensions,
+    reconcileRevertState,
+} from "./revert"
 export { injectCompressNudges } from "./inject/inject"
 export { injectMessageIds } from "./inject/inject"
 export { injectExtendedSubAgentResults } from "./inject/subagent-results"

@@ -26,6 +26,10 @@ import {
     prune,
     stripHallucinations,
     syncCompressionBlocks,
+    suspendRevertedBlocks,
+    clearRevertSuspensions,
+    commitRevertSuspensions,
+    reconcileRevertState,
 } from "../messages"
 import { countTokens } from "../token-utils"
 import { formatProgressBar } from "../ui/utils"
@@ -47,6 +51,7 @@ let emitNotify:
           duration?: number
       }) => Promise<void>)
     | undefined
+let emitRefresh: ((event: { sessionID: string }) => Promise<void>) | undefined
 
 const REPORT_TOAST_MAX_CHARS = 2000
 
@@ -64,6 +69,27 @@ export async function report(logger: Logger, text: string, sessionID?: string) {
     }
 }
 
+type ProgressSegment = {
+    state: "active" | "pruned" | "recent"
+    count: number
+}
+
+function buildProgressSegments(
+    messageIds: string[],
+    pruned: Map<string, number>,
+    recentMessageIds: string[],
+): ProgressSegment[] {
+    const recent = new Set(recentMessageIds)
+    const segments: ProgressSegment[] = []
+    for (const messageId of messageIds) {
+        const state = recent.has(messageId) ? "recent" : pruned.has(messageId) ? "pruned" : "active"
+        const last = segments.at(-1)
+        if (last?.state === state) last.count++
+        else segments.push({ state, count: 1 })
+    }
+    return segments
+}
+
 function buildProgressView(state: SessionState, messages: WithParts[]) {
     const ids = messages.map((message) => message.info.id)
     const pruned = new Map<string, number>()
@@ -77,6 +103,7 @@ function buildProgressView(state: SessionState, messages: WithParts[]) {
         : []
     return {
         bar: formatProgressBar(ids, pruned, recentMessageIds, 50),
+        segments: buildProgressSegments(ids, pruned, recentMessageIds),
         compressed: pruned.size,
         total: ids.length,
         ...(blockId !== undefined ? { blockId } : {}),
@@ -159,7 +186,11 @@ export async function setup(ctx: Plugin.Context) {
         },
     }
 
-    async function load(sessionID: string, agentID?: string) {
+    async function load(
+        sessionID: string,
+        agentID?: string,
+        options?: { reconcileRevert?: boolean },
+    ) {
         const [session, entries] = await Promise.all([
             ctx.session.get({ sessionID }),
             ctx.session.context({ sessionID }),
@@ -185,6 +216,15 @@ export async function setup(ctx: Plugin.Context) {
             config.manualMode.enabled,
         )
         await checkSession(client, state, logger, messages, config.manualMode.enabled)
+        // Undo/redo can change compression validity between plugin lifetimes or
+        // while a running turn is being reverted. Reconcile from the session's
+        // staged boundary before anyone reads the block state.
+        if (options?.reconcileRevert !== false) {
+            const change = reconcileRevertState(state, logger, messages, session.revert?.messageID)
+            if (change.changed) {
+                await saveSessionState(state, logger)
+            }
+        }
         // Only rules that name the "compress" action explicitly decide DCP's
         // verdict. V2 hosts ship agents with catch-all deny/ask policies and
         // treat unmatched actions as "ask"; honoring those wildcards here
@@ -515,6 +555,20 @@ export async function setup(ctx: Plugin.Context) {
     await ctx.rpc
         .register(rpc, {
             status: async () => ({ enabled: config.commands.enabled }),
+            sidebar: ({ sessionID }) =>
+                serial(sessionID, async () => {
+                    const { state, messages } = await load(sessionID)
+                    syncCompressionBlocks(state, logger, messages)
+                    return {
+                        manualMode: !!state.manualMode,
+                        canCompress:
+                            state.compressPermission !== "deny" &&
+                            (!state.isSubAgent || config.experimental.allowSubAgents),
+                        contextLimit: state.modelContextLimit ?? 0,
+                        context: analyzeContextTokens(state, messages),
+                        progress: buildProgressView(state, messages),
+                    }
+                }),
             snapshot: ({ sessionID }) =>
                 serial(sessionID, async () => {
                     const { state, messages } = await load(sessionID)
@@ -524,6 +578,7 @@ export async function setup(ctx: Plugin.Context) {
                         canCompress:
                             state.compressPermission !== "deny" &&
                             (!state.isSubAgent || config.experimental.allowSubAgents),
+                        contextLimit: state.modelContextLimit ?? 0,
                         context: analyzeContextTokens(state, messages),
                         stats: await buildStatsReport(state, logger),
                         progress: buildProgressView(state, messages),
@@ -540,9 +595,92 @@ export async function setup(ctx: Plugin.Context) {
         .then((registration) => {
             if (!registration?.events) return
             emitNotify = (event) => registration.events.emit("notify", event)
+            emitRefresh = (event) => registration.events.emit("refresh", event)
         })
+
+    // /undo is a session revert, not a compression command: the host stages a
+    // boundary and later clears (redo) or commits it. Keep compression blocks
+    // created in the reverted tail aligned with that boundary, otherwise the
+    // pruned ranges stay hidden after the turn that produced them was undone.
+    const revertController = new AbortController()
+    const revertEvents = ctx.event as unknown as
+        | {
+              subscribe: (options: { types: string[]; signal: AbortSignal }) => AsyncIterable<{
+                  type: string
+                  data: { sessionID: string; revert?: { messageID?: string } }
+              }>
+          }
+        | undefined
+    if (typeof revertEvents?.subscribe === "function") {
+        void (async () => {
+            try {
+                for await (const event of revertEvents.subscribe({
+                    types: [
+                        "session.revert.staged",
+                        "session.revert.cleared",
+                        "session.revert.committed",
+                    ],
+                    signal: revertController.signal,
+                })) {
+                    const sessionID = event.data?.sessionID
+                    if (!sessionID || revertController.signal.aborted) continue
+
+                    // Never block the shared event stream on one slow session.
+                    // serial() still preserves per-session ordering.
+                    const type = event.type
+                    const boundary = event.data.revert?.messageID
+                    void serial(sessionID, async () => {
+                        if (type === "session.revert.committed") {
+                            const { state, messages } = await load(sessionID, undefined, {
+                                reconcileRevert: false,
+                            })
+                            const change = commitRevertSuspensions(state, logger, messages)
+                            if (change.changed) {
+                                await saveSessionState(state, logger)
+                                await emitRefresh?.({ sessionID }).catch(() => {})
+                            }
+                            return
+                        }
+
+                        const { state, messages } = await load(sessionID, undefined, {
+                            reconcileRevert: false,
+                        })
+                        if (type === "session.revert.staged") {
+                            if (!boundary) return
+                            const change = suspendRevertedBlocks(state, logger, messages, boundary)
+                            if (change.changed) {
+                                await saveSessionState(state, logger)
+                                await emitRefresh?.({ sessionID }).catch(() => {})
+                            }
+                            return
+                        }
+
+                        const change = clearRevertSuspensions(state, logger, messages)
+                        if (change.changed) {
+                            await saveSessionState(state, logger)
+                            await emitRefresh?.({ sessionID }).catch(() => {})
+                        }
+                    }).catch((cause) => {
+                        logger.warn("DCP revert event handling failed", {
+                            sessionID,
+                            type,
+                            error: cause instanceof Error ? cause.message : String(cause),
+                        })
+                    })
+                }
+            } catch (cause) {
+                if (!revertController.signal.aborted) {
+                    logger.warn("DCP revert event subscription stopped", {
+                        error: cause instanceof Error ? cause.message : String(cause),
+                    })
+                }
+            }
+        })()
+    }
+
     logger.info("DCP V2 initialized")
     return () => {
+        revertController.abort()
         sessions.clear()
         limits.clear()
         served = undefined

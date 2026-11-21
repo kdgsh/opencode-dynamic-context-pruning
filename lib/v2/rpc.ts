@@ -29,6 +29,14 @@ const context = z.object({
 })
 const progress = z.object({
     bar: z.string(),
+    segments: z
+        .array(
+            z.object({
+                state: z.enum(["active", "pruned", "recent"]),
+                count: z.number(),
+            }),
+        )
+        .optional(),
     compressed: z.number(),
     total: z.number(),
     blockId: z.number().optional(),
@@ -38,12 +46,26 @@ export const rpc = {
     id: "dcp",
     methods: {
         status: { input: z.object({}), output: z.object({ enabled: z.boolean() }) },
+        // Lightweight payload for the sidebar: same context/progress fields as
+        // snapshot, without the all-time stats scan or dialog-only fields.
+        sidebar: {
+            input: session,
+            output: z.object({
+                manualMode: z.boolean(),
+                canCompress: z.boolean(),
+                blockedReason: z.string().optional(),
+                contextLimit: z.number().optional(),
+                context,
+                progress,
+            }),
+        },
         snapshot: {
             input: session,
             output: z.object({
                 manualMode: z.boolean(),
                 canCompress: z.boolean(),
                 blockedReason: z.string().optional(),
+                contextLimit: z.number().optional(),
                 context,
                 stats,
                 progress,
@@ -60,6 +82,11 @@ export const rpc = {
                 message: z.string(),
                 variant: z.enum(["info", "success", "warning", "error"]).optional(),
                 duration: z.number().optional(),
+            }),
+        },
+        refresh: {
+            schema: z.object({
+                sessionID: z.string(),
             }),
         },
     },
