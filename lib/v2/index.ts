@@ -13,6 +13,7 @@ import {
     saveSessionState,
     syncToolCache,
     type SessionState,
+    type WithParts,
 } from "../state"
 import { assignMessageRefs } from "../message-ids"
 import { applyPendingManualTrigger } from "../commands/manual"
@@ -60,6 +61,25 @@ export async function report(logger: Logger, text: string, sessionID?: string) {
         await emitNotify({ title: "DCP", message })
     } catch (cause) {
         logger.debug("V2 report emit failed", { error: String(cause) })
+    }
+}
+
+function buildProgressView(state: SessionState, messages: WithParts[]) {
+    const ids = messages.map((message) => message.info.id)
+    const pruned = new Map<string, number>()
+    for (const [messageId, entry] of state.prune.messages.byMessageId) {
+        if (entry.activeBlockIds.length > 0) pruned.set(messageId, entry.tokenCount)
+    }
+    const activeBlockIds = [...state.prune.messages.activeBlockIds].sort((a, b) => a - b)
+    const blockId = activeBlockIds.at(-1)
+    const recentMessageIds = blockId
+        ? (state.prune.messages.blocksById.get(blockId)?.directMessageIds ?? [])
+        : []
+    return {
+        bar: formatProgressBar(ids, pruned, recentMessageIds, 50),
+        compressed: pruned.size,
+        total: ids.length,
+        ...(blockId !== undefined ? { blockId } : {}),
     }
 }
 
@@ -506,30 +526,7 @@ export async function setup(ctx: Plugin.Context) {
                             (!state.isSubAgent || config.experimental.allowSubAgents),
                         context: analyzeContextTokens(state, messages),
                         stats: await buildStatsReport(state, logger),
-                    }
-                }),
-            progress: ({ sessionID }) =>
-                serial(sessionID, async () => {
-                    const { state, messages } = await load(sessionID)
-                    syncCompressionBlocks(state, logger, messages)
-                    const ids = messages.map((message) => message.info.id)
-                    const pruned = new Map<string, number>()
-                    for (const [messageId, entry] of state.prune.messages.byMessageId) {
-                        if (entry.activeBlockIds.length > 0) pruned.set(messageId, entry.tokenCount)
-                    }
-                    const activeBlockIds = [...state.prune.messages.activeBlockIds].sort(
-                        (a, b) => a - b,
-                    )
-                    const blockId = activeBlockIds.at(-1)
-                    const recentMessageIds = blockId
-                        ? (state.prune.messages.blocksById.get(blockId)?.directMessageIds ?? [])
-                        : []
-                    return {
-                        bar: formatProgressBar(ids, pruned, recentMessageIds, 12),
-                        compressed: pruned.size,
-                        total: ids.length,
-                        activeBlocks: activeBlockIds.length,
-                        blockId,
+                        progress: buildProgressView(state, messages),
                     }
                 }),
             manual: ({ sessionID, enabled }) =>

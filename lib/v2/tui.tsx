@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
+import type { BoxRenderable } from "@opentui/core"
 import type { Plugin } from "@opencode/plugin/tui"
-import { createEffect, createSignal } from "solid-js"
 import { ContextDialog, PanelDialog, StatsDialog, StatusDialog } from "../tui/dialogs"
 import type { ViewApi } from "../tui/types"
 import { rpc } from "./rpc"
@@ -10,11 +10,6 @@ export async function setup(ctx: Plugin.Context) {
     const client = ctx.client.rpc(rpc)
     const options = () => ({ location: ctx.location ?? ctx.data.location.default() })
     if (!(await client.status({}, options())).enabled) return
-
-    const [progressTick, setProgressTick] = createSignal(0)
-    if (typeof ctx.data?.on === "function") {
-        ctx.data.on("rpc.dcp.notify", () => setProgressTick((value) => value + 1))
-    }
 
     // Render server-side DCP reports as transient toasts. Events are
     // ephemeral: nothing stored, nothing in model context.
@@ -57,42 +52,117 @@ export async function setup(ctx: Plugin.Context) {
         bar: string
         compressed: number
         total: number
-        activeBlocks: number
         blockId?: number
+        loaded: boolean
+        error: string
+        width: number
+    }
+
+    const [progress, setProgress] = ctx.storage.memory("dcp.progress", {
+        initial: {
+            bar: "│░░░░░░░░░░░░░░│",
+            compressed: 0,
+            total: 0,
+            blockId: undefined as number | undefined,
+            loaded: false as boolean,
+            error: "",
+            width: 24,
+        } satisfies ProgressView,
+    })
+    let activeSession: string | undefined
+    let refreshing = false
+
+    const refresh = async () => {
+        if (!activeSession || refreshing) return
+        refreshing = true
+        try {
+            const next = await client.snapshot({ sessionID: activeSession }, options())
+            setProgress((draft) => {
+                draft.bar = next.progress.bar
+                draft.compressed = next.progress.compressed
+                draft.total = next.progress.total
+                draft.blockId = next.progress.blockId
+                draft.loaded = true
+                draft.error = ""
+            })
+        } catch (cause) {
+            setProgress((draft) => {
+                draft.loaded = true
+                draft.error = cause instanceof Error ? cause.message : String(cause)
+            })
+        } finally {
+            refreshing = false
+        }
+    }
+
+    if (typeof ctx.data?.on === "function") {
+        ctx.data.on("rpc.dcp.notify", () => {
+            void refresh()
+        })
+    }
+
+    function fitBar(bar: string, width: number): string {
+        const inner = bar.replace(/^│|│$/g, "")
+        const cells = Math.max(8, width)
+        if (!inner) return `│${"░".repeat(cells)}│`
+        const fitted = Array.from({ length: cells }, (_, index) => {
+            const source = Math.floor((index * inner.length) / cells)
+            return inner[source] ?? "░"
+        })
+        return `│${fitted.join("")}│`
+    }
+
+    let barBox: BoxRenderable | undefined
+    function updateWidth() {
+        const width = barBox?.width ?? 0
+        if (width <= 0) return
+        const cells = Math.max(8, width - 2)
+        if (cells !== progress.width) {
+            setProgress((draft) => {
+                draft.width = cells
+            })
+        }
     }
 
     function SidebarProgress(props: { sessionID: string }) {
-        const [value, setValue] = createSignal<ProgressView | null>(null)
-        createEffect(() => {
-            const sessionID = props.sessionID
-            progressTick()
-            void client
-                .progress({ sessionID }, options())
-                .then(setValue)
-                .catch(() => setValue(null))
-        })
-        const data = value()
-        if (!data) return null
+        if (activeSession !== props.sessionID) {
+            activeSession = props.sessionID
+            queueMicrotask(() => {
+                void refresh()
+            })
+        }
+        const status = progress.loaded ? `${progress.compressed}/${progress.total}` : "loading"
         return (
-            <box flexDirection="row" gap={1}>
-                <text fg={api.theme.current.accent}>DCP</text>
-                <text fg={api.theme.current.text}>{data.bar}</text>
-                {data.blockId ? (
-                    <text fg={api.theme.current.textMuted}>b{data.blockId}</text>
-                ) : null}
+            <box
+                ref={(r: BoxRenderable) => {
+                    barBox = r
+                    updateWidth()
+                }}
+                onSizeChange={updateWidth}
+                flexDirection="column"
+                gap={0}
+                paddingTop={1}
+                width="100%"
+            >
+                <text fg={api.theme.current.text}>{fitBar(progress.bar, progress.width)}</text>
                 <text fg={api.theme.current.textMuted}>
-                    {data.compressed}/{data.total}
+                    {progress.blockId ? `b${progress.blockId} · ` : ""}
+                    {status}
                 </text>
+                {progress.error ? <text fg={api.theme.current.error}>{progress.error}</text> : null}
             </box>
         )
     }
 
     ctx.ui.slot({
-        append: "sidebar.footer",
+        append: "sidebar.content",
         render(input) {
             return <SidebarProgress sessionID={input.sessionID} />
         },
     })
+    const progressTimer = setInterval(() => {
+        void refresh()
+    }, 10000)
 
     function show(render: Parameters<typeof ctx.ui.dialog.show>[0]) {
         ctx.ui.dialog.set({ size: "xlarge" })
@@ -188,4 +258,5 @@ export async function setup(ctx: Plugin.Context) {
             return null
         },
     })
+    return () => clearInterval(progressTimer)
 }
